@@ -1,180 +1,144 @@
 
 import cv2
 import time
-import mediapipe as mp
 
-from pathlib import Path
+from src.landing_file import detector, antispoof
 
-
-
-raiz = Path(__file__).resolve().parent
-ruta_modelo = raiz / "models" / "face_landmarker.task"
-
-if not ruta_modelo.is_file():
-    raise FileNotFoundError(f"No existe: {ruta_modelo}")
-
-BaseOptions = mp.tasks.BaseOptions
-FaceLandmarker = mp.tasks.vision.FaceLandmarker
-FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
-RunningMode = mp.tasks.vision.RunningMode
-
-opciones = FaceLandmarkerOptions(
-    base_options=BaseOptions(
-        model_asset_path=str(ruta_modelo)
-    ),
-    running_mode=RunningMode.VIDEO,
-    num_faces=1,
-    output_face_blendshapes=True
-)
-
-UMBRAL_CERRADO = 0.60
-UMBRAL_ABIERTO = 0.30
-FRAMES_MINIMOS_CERRADO = 2
-
-estado = "ESPERANDO_ABIERTO"
-frames_cerrados = 0
-parpadeos = 0
-
-
+# =====================================
+# 1. INICIAR WEBCAM
+# =====================================
 
 webcam = cv2.VideoCapture(0)
 
 if not webcam.isOpened():
     raise RuntimeError("No se pudo abrir la webcam")
 
-inicio = time.perf_counter()
-ultimo_timestamp = -1
+webcam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+print("Webcam iniciada correctamente")
+
+tiempo_anterior = time.perf_counter()
+
+# =====================================
+# 2. PROCESAR FRAMES
+# =====================================
 
 try:
-    with FaceLandmarker.create_from_options(opciones) as landmarker:
+    while True:
 
-        while True:
-            ret, frame = webcam.read()
+        ret, frame = webcam.read()
 
-            if not ret:
-                break
+        if not ret:
+            print("Error al capturar el frame")
+            break
 
-            rgb = cv2.cvtColor(
+        alto, ancho = frame.shape[:2]
+
+        detector.setInputSize((ancho, alto))
+
+        # Detectar rostros con YuNet
+        _, rostros = detector.detect(frame)
+
+        cantidad = 0 if rostros is None else len(rostros)
+
+        if cantidad > 1:
+            mensaje = "Solo debe aparecer un rostro"
+        elif cantidad == 1:
+            rostro = rostros[0]
+            score_real = antispoof.evaluar(frame, rostro)
+
+        mensaje = "Coloca tu rostro frente a la camara"
+        color = (255, 255, 255)
+
+        if cantidad > 1:
+            mensaje = "Solo debe aparecer un rostro"
+            color = (0, 0, 255)
+
+        elif cantidad == 1:
+
+            rostro = rostros[0]
+
+            x, y, w, h = rostro[:4].astype(int)
+
+            # Ejecutar MiniFASNetV2
+            score_real = antispoof.evaluar(
                 frame,
-                cv2.COLOR_BGR2RGB
+                rostro
             )
 
-            imagen_mp = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=rgb
-            )
+            # Solo mostramos la puntuacion
+            # No usamos un umbral de autenticacion
+            mensaje = f"PAD score: {score_real:.3f}"
+            color = (0, 255, 255)
 
-            timestamp_ms = int(
-                (time.perf_counter() - inicio) * 1000
-            )
-            timestamp_ms = max(
-                timestamp_ms,
-                ultimo_timestamp + 1
-            )
-            ultimo_timestamp = timestamp_ms
-
-            resultado = landmarker.detect_for_video(
-                imagen_mp,
-                timestamp_ms
-            )
-
-            mensaje = "Colocate frente a la camara"
-
-            if resultado.face_blendshapes:
-
-                expresiones = {
-                    item.category_name: item.score
-                    for item in resultado.face_blendshapes[0]
-                }
-
-                ojo_izquierdo = expresiones.get(
-                    "eyeBlinkLeft", 0.0
-                )
-
-                ojo_derecho = expresiones.get(
-                    "eyeBlinkRight", 0.0
-                )
-
-                ambos_cerrados = (
-                    ojo_izquierdo >= UMBRAL_CERRADO
-                    and ojo_derecho >= UMBRAL_CERRADO
-                )
-
-                ambos_abiertos = (
-                    ojo_izquierdo <= UMBRAL_ABIERTO
-                    and ojo_derecho <= UMBRAL_ABIERTO
-                )
-
-                if estado == "ESPERANDO_ABIERTO":
-                    if ambos_abiertos:
-                        estado = "ESPERANDO_CIERRE"
-
-                elif estado == "ESPERANDO_CIERRE":
-                    if ambos_cerrados:
-                        frames_cerrados = 1
-                        estado = "CERRANDO"
-
-                elif estado == "CERRANDO":
-                    if ambos_cerrados:
-                        frames_cerrados += 1
-
-                    elif ambos_abiertos:
-                        if frames_cerrados >= FRAMES_MINIMOS_CERRADO:
-                            parpadeos += 1
-
-                        frames_cerrados = 0
-                        estado = "ESPERANDO_CIERRE"
-
-                mensaje = f"Estado: {estado}"
-
-                cv2.putText(
-                    frame,
-                    f"Ojo Izq: {ojo_izquierdo:.2f}",
-                    (20, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    2
-                )
-
-                cv2.putText(
-                    frame,
-                    f"Ojo Der: {ojo_derecho:.2f}",
-                    (20, 140),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    2
-                )
-
-            else:
-                estado = "ESPERANDO_ABIERTO"
-                frames_cerrados = 0
-
-            cv2.putText(
+            cv2.rectangle(
                 frame,
-                f"Parpadeos: {parpadeos}",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
+                (x, y),
+                (x + w, y + h),
+                color,
                 2
             )
 
-            cv2.putText(
-                frame,
-                mensaje,
-                (20, 75),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 255, 255),
-                2
+            print(
+                f"\rPAD score: {score_real:.4f}",
+                end="",
+                flush=True
             )
 
-            cv2.imshow("Clase 15 - Parpadeos", frame)
+        # =====================================
+        # 3. CALCULAR FPS
+        # =====================================
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+        tiempo_actual = time.perf_counter()
+
+        diferencia = tiempo_actual - tiempo_anterior
+
+        fps = 1 / diferencia if diferencia > 0 else 0
+
+        tiempo_anterior = tiempo_actual
+
+        # =====================================
+        # 4. MOSTRAR INFORMACION
+        # =====================================
+
+        cv2.putText(
+            frame,
+            f"Rostros: {cantidad}",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            f"FPS: {fps:.1f}",
+            (20, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            mensaje,
+            (20, 105),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            color,
+            2
+        )
+
+        cv2.imshow(
+            "Prueba Anti-Spoofing - MiniFASNetV2",
+            frame
+        )
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
 
 finally:
     webcam.release()
